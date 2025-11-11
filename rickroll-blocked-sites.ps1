@@ -25,13 +25,21 @@
 #>
 
 param(
-    [string]$BlockedSites = $env:BLOCKED_SITES
+    [string]$BlockedSites = $env:BLOCKED_SITES,
+    [string]$RickRollURL = $env:RICKROLL_URL
 )
+
+# Default Rick Roll URL if not specified
+if ([string]::IsNullOrWhiteSpace($RickRollURL)) {
+    $RickRollURL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+}
 
 # Configuration constants
 $HOSTS_FILE = "$env:SystemRoot\System32\drivers\etc\hosts"
 $BACKUP_FILE = "$env:SystemRoot\System32\drivers\etc\hosts.rickroll.backup"
 $LOG_FILE = "$env:ProgramData\DattoRMM\RickRoll.log"
+$LISTENER_SCRIPT = "$env:ProgramData\DattoRMM\rickroll-http-listener.ps1"
+$TASK_NAME = "RickRollHTTPListener"
 $MARKER_TAG = "# RICKROLL_BLOCK"
 $MAX_RETRIES = 3
 $RETRY_DELAY_SECONDS = 2
@@ -300,6 +308,199 @@ function Clear-DNSCache {
     }
 }
 
+function Deploy-HTTPListener {
+    <#
+    .SYNOPSIS
+        Deploys HTTP listener script to handle localhost redirects.
+    .DESCRIPTION
+        Creates the PowerShell script that listens on port 80 and redirects
+        blocked domain requests to the Rick Roll URL.
+    #>
+    try {
+        Write-Log "Deploying HTTP listener script" -Level INFO
+
+        # HTTP listener script content (embedded for single-file deployment)
+        $listenerScript = @'
+#Requires -RunAsAdministrator
+param([string]$RickRollURL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+$LOG_FILE = "$env:ProgramData\DattoRMM\RickRoll.log"
+$PID_FILE = "$env:ProgramData\DattoRMM\RickRoll.pid"
+
+function Write-Log {
+    param([string]$Message, [string]$Level = 'INFO')
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    try {
+        "$timestamp [$Level] $Message" | Out-File -FilePath $LOG_FILE -Append -Encoding UTF8
+    } catch {}
+}
+
+$redirectHTML = @"
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Access Denied</title>
+<meta http-equiv="refresh" content="2; url=$RickRollURL">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: 'Segoe UI', Tahoma, sans-serif;
+    display: flex; justify-content: center; align-items: center;
+    min-height: 100vh; text-align: center; padding: 20px;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+}
+.container {
+    max-width: 600px; padding: 40px;
+    background: rgba(0,0,0,0.3); border-radius: 15px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+}
+h1 { font-size: 3em; margin-bottom: 20px; animation: pulse 2s infinite; }
+p { font-size: 1.3em; margin: 15px 0; line-height: 1.6; }
+.spinner {
+    margin: 30px auto; width: 50px; height: 50px;
+    border: 5px solid rgba(255,255,255,0.3);
+    border-top: 5px solid white; border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+@keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.05); } }
+</style></head><body>
+<div class="container">
+    <h1>🚫 Site Blocked</h1>
+    <p><strong>This website violates company policy.</strong></p>
+    <p>Access has been denied by your IT department.</p>
+    <div class="spinner"></div>
+    <p><em>Redirecting to approved content...</em></p>
+    <p style="font-size: 0.9em; margin-top: 30px; opacity: 0.8;">
+        Never gonna give you up! 🎵
+    </p>
+</div></body></html>
+"@
+
+try {
+    $PID | Out-File -FilePath $PID_FILE -Force
+    Write-Log "Starting HTTP listener on port 80 (PID: $PID)"
+
+    $portInUse = Get-NetTCPConnection -LocalPort 80 -State Listen -ErrorAction SilentlyContinue
+    if ($portInUse) {
+        Write-Log "Port 80 already in use" -Level WARN
+        exit 0
+    }
+
+    $listener = New-Object System.Net.HttpListener
+    $listener.Prefixes.Add("http://127.0.0.1:80/")
+    $listener.Prefixes.Add("http://localhost:80/")
+    $listener.Start()
+    Write-Log "HTTP listener started successfully"
+
+    $redirectBytes = [System.Text.Encoding]::UTF8.GetBytes($redirectHTML)
+
+    while ($listener.IsListening) {
+        try {
+            $context = $listener.GetContext()
+            $request = $context.Request
+            $response = $context.Response
+
+            Write-Log "Blocked: $($request.Url) from $($request.RemoteEndPoint.Address)"
+
+            $response.StatusCode = 200
+            $response.ContentType = "text/html; charset=utf-8"
+            $response.ContentLength64 = $redirectBytes.Length
+            $response.OutputStream.Write($redirectBytes, 0, $redirectBytes.Length)
+            $response.OutputStream.Close()
+        } catch {
+            Write-Log "Request error: $_" -Level WARN
+        }
+    }
+} catch {
+    Write-Log "Listener failed: $_" -Level ERROR
+} finally {
+    if ($listener -and $listener.IsListening) {
+        $listener.Stop()
+        $listener.Close()
+    }
+    if (Test-Path $PID_FILE) {
+        Remove-Item -Path $PID_FILE -Force -ErrorAction SilentlyContinue
+    }
+}
+'@
+
+        # Create directory if needed
+        $scriptDir = Split-Path -Path $LISTENER_SCRIPT -Parent
+        if (-not (Test-Path $scriptDir)) {
+            New-Item -ItemType Directory -Path $scriptDir -Force | Out-Null
+        }
+
+        # Deploy listener script
+        $listenerScript | Out-File -FilePath $LISTENER_SCRIPT -Encoding UTF8 -Force
+        Write-Log "HTTP listener script deployed to: $LISTENER_SCRIPT" -Level INFO
+
+        return $true
+    }
+    catch {
+        Write-Log "Failed to deploy HTTP listener: $_" -Level ERROR
+        return $false
+    }
+}
+
+function Start-HTTPListenerService {
+    <#
+    .SYNOPSIS
+        Creates scheduled task and starts HTTP listener.
+    .DESCRIPTION
+        Registers a scheduled task that runs the HTTP listener at system startup
+        and starts it immediately as a background process.
+    #>
+    try {
+        Write-Log "Configuring HTTP listener service" -Level INFO
+
+        # Check if scheduled task already exists
+        $existingTask = Get-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
+
+        if ($existingTask) {
+            Write-Log "Removing existing scheduled task" -Level INFO
+            Unregister-ScheduledTask -TaskName $TASK_NAME -Confirm:$false -ErrorAction SilentlyContinue
+        }
+
+        # Create scheduled task action
+        $action = New-ScheduledTaskAction -Execute "PowerShell.exe" `
+            -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$LISTENER_SCRIPT`" -RickRollURL `"$RickRollURL`""
+
+        # Create scheduled task trigger (at startup)
+        $trigger = New-ScheduledTaskTrigger -AtStartup
+
+        # Create scheduled task principal (run as SYSTEM with highest privileges)
+        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+        # Create scheduled task settings
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+
+        # Register the scheduled task
+        Register-ScheduledTask -TaskName $TASK_NAME -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "Rick Roll HTTP redirect listener for blocked domains" | Out-Null
+
+        Write-Log "Scheduled task '$TASK_NAME' created successfully" -Level INFO
+
+        # Start the listener immediately as background job
+        Write-Log "Starting HTTP listener process" -Level INFO
+        Start-ScheduledTask -TaskName $TASK_NAME -ErrorAction Stop
+
+        # Wait a moment and verify it started
+        Start-Sleep -Seconds 2
+        $listenerPort = Get-NetTCPConnection -LocalPort 80 -State Listen -ErrorAction SilentlyContinue
+
+        if ($listenerPort) {
+            Write-Log "HTTP listener is running on port 80" -Level INFO
+            return $true
+        }
+        else {
+            Write-Log "HTTP listener may not be running (check firewall/port conflicts)" -Level WARN
+            return $true  # Don't fail deployment if listener doesn't start immediately
+        }
+    }
+    catch {
+        Write-Log "Failed to start HTTP listener service: $_" -Level ERROR
+        return $false
+    }
+}
+
 #endregion
 
 #region Main Execution
@@ -393,11 +594,28 @@ function Invoke-RickRollBlocker {
     # Flush DNS cache
     Clear-DNSCache | Out-Null
 
+    # Deploy and start HTTP listener for localhost redirects
+    Write-Log "Setting up HTTP redirect listener" -Level INFO
+
+    if (-not (Deploy-HTTPListener)) {
+        Write-Log "WARNING: HTTP listener deployment failed, redirects may not work" -Level WARN
+        Write-Output "WARNING: Hosts file updated but HTTP listener failed to deploy"
+        exit 0
+    }
+
+    if (-not (Start-HTTPListenerService)) {
+        Write-Log "WARNING: HTTP listener service failed to start" -Level WARN
+        Write-Output "WARNING: Hosts file updated but HTTP listener failed to start"
+        exit 0
+    }
+
     Write-Log "=== Rick Roll Blocker Completed Successfully ===" -Level INFO
     Write-Log "Blocked domains: $($validDomains.Count)" -Level INFO
+    Write-Log "Rick Roll URL: $RickRollURL" -Level INFO
     Write-Log "Backup location: $BACKUP_FILE" -Level INFO
+    Write-Log "HTTP listener: Active on port 80" -Level INFO
 
-    Write-Output "SUCCESS: Blocked $($validDomains.Count) domains"
+    Write-Output "SUCCESS: Blocked $($validDomains.Count) domains with HTTP redirect active"
     exit 0
 }
 

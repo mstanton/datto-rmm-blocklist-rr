@@ -26,6 +26,9 @@ param()
 $HOSTS_FILE = "$env:SystemRoot\System32\drivers\etc\hosts"
 $BACKUP_FILE = "$env:SystemRoot\System32\drivers\etc\hosts.rickroll.backup"
 $LOG_FILE = "$env:ProgramData\DattoRMM\RickRoll.log"
+$LISTENER_SCRIPT = "$env:ProgramData\DattoRMM\rickroll-http-listener.ps1"
+$PID_FILE = "$env:ProgramData\DattoRMM\RickRoll.pid"
+$TASK_NAME = "RickRollHTTPListener"
 $MARKER_TAG = "# RICKROLL_BLOCK"
 $MAX_RETRIES = 3
 $RETRY_DELAY_SECONDS = 2
@@ -263,20 +266,109 @@ function Remove-RickRollArtifacts {
         Removes Rick Roll HTML files and other artifacts.
     #>
     try {
-        $htmlPath = "$env:ProgramData\DattoRMM\rickroll.html"
+        $artifactsRemoved = 0
 
+        # Remove HTML file if exists
+        $htmlPath = "$env:ProgramData\DattoRMM\rickroll.html"
         if (Test-Path $htmlPath) {
             Remove-Item -Path $htmlPath -Force -ErrorAction Stop
             Write-Log "Removed Rick Roll HTML file" -Level INFO
+            $artifactsRemoved++
         }
-        else {
-            Write-Log "No Rick Roll HTML file found" -Level INFO
+
+        # Remove listener script if exists
+        if (Test-Path $LISTENER_SCRIPT) {
+            Remove-Item -Path $LISTENER_SCRIPT -Force -ErrorAction Stop
+            Write-Log "Removed HTTP listener script" -Level INFO
+            $artifactsRemoved++
+        }
+
+        # Remove PID file if exists
+        if (Test-Path $PID_FILE) {
+            Remove-Item -Path $PID_FILE -Force -ErrorAction Stop
+            Write-Log "Removed PID file" -Level INFO
+            $artifactsRemoved++
+        }
+
+        if ($artifactsRemoved -eq 0) {
+            Write-Log "No Rick Roll artifacts found" -Level INFO
         }
 
         return $true
     }
     catch {
         Write-Log "Failed to remove Rick Roll artifacts: $_" -Level WARN
+        return $false
+    }
+}
+
+function Stop-HTTPListenerService {
+    <#
+    .SYNOPSIS
+        Stops HTTP listener process and removes scheduled task.
+    .DESCRIPTION
+        Terminates the running HTTP listener process and unregisters
+        the scheduled task that starts it at system startup.
+    #>
+    try {
+        Write-Log "Stopping HTTP listener service" -Level INFO
+
+        # Stop scheduled task if running
+        $task = Get-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
+
+        if ($task) {
+            Write-Log "Found scheduled task '$TASK_NAME'" -Level INFO
+
+            # Stop the task if running
+            if ($task.State -eq 'Running') {
+                Stop-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
+                Write-Log "Stopped scheduled task" -Level INFO
+                Start-Sleep -Seconds 1
+            }
+
+            # Unregister the task
+            Unregister-ScheduledTask -TaskName $TASK_NAME -Confirm:$false -ErrorAction Stop
+            Write-Log "Removed scheduled task '$TASK_NAME'" -Level INFO
+        }
+        else {
+            Write-Log "No scheduled task found" -Level INFO
+        }
+
+        # Kill any PowerShell processes running the listener script
+        $listenerProcesses = Get-WmiObject Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction SilentlyContinue | Where-Object {
+            $_.CommandLine -like "*rickroll-http-listener.ps1*"
+        }
+
+        if ($listenerProcesses) {
+            foreach ($process in $listenerProcesses) {
+                try {
+                    Write-Log "Terminating HTTP listener process (PID: $($process.ProcessId))" -Level INFO
+                    Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+                }
+                catch {
+                    Write-Log "Failed to terminate process $($process.ProcessId): $_" -Level WARN
+                }
+            }
+        }
+        else {
+            Write-Log "No HTTP listener processes found" -Level INFO
+        }
+
+        # Verify port 80 is released
+        Start-Sleep -Seconds 1
+        $portInUse = Get-NetTCPConnection -LocalPort 80 -State Listen -ErrorAction SilentlyContinue
+
+        if (-not $portInUse) {
+            Write-Log "Port 80 is now free" -Level INFO
+        }
+        else {
+            Write-Log "Port 80 is still in use by another process" -Level WARN
+        }
+
+        return $true
+    }
+    catch {
+        Write-Log "Failed to stop HTTP listener service: $_" -Level ERROR
         return $false
     }
 }
@@ -301,6 +393,10 @@ function Invoke-RickRollRemoval {
         Write-Output "FAILED: Must run as Administrator"
         exit 1
     }
+
+    # Stop HTTP listener service first (before removing files)
+    Write-Log "Stopping HTTP redirect listener" -Level INFO
+    Stop-HTTPListenerService | Out-Null
 
     # Verify hosts file exists
     if (-not (Test-Path $HOSTS_FILE)) {
