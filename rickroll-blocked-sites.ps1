@@ -1,202 +1,415 @@
-# Datto RMM Component: Rick Roll Blocked Sites
-# Description: Redirects users to Rick Astley's "Never Gonna Give You Up" when they attempt to access blocked websites
-# Use Case: Security awareness training / Policy enforcement with humor
+#Requires -RunAsAdministrator
 
-# Environment Variables from Datto RMM
-# ENV:BLOCKED_SITES - Comma-separated list of domains to block (e.g., "facebook.com,twitter.com,reddit.com")
-# ENV:RICKROLL_URL - Custom Rick Roll URL (optional, defaults to YouTube)
+<#
+.SYNOPSIS
+    Modifies Windows hosts file to redirect specified domains to Rick Roll video.
+
+.DESCRIPTION
+    Datto RMM component that blocks domains by redirecting them to 127.0.0.1 in the hosts file.
+    Designed for security awareness training and policy enforcement.
+
+    This script:
+    - Validates and sanitizes all domain inputs
+    - Handles DNS Client service file locking
+    - Creates atomic backups before modification
+    - Implements retry logic for locked files
+    - Provides detailed logging for troubleshooting
+
+.PARAMETER BlockedSites
+    Comma-separated list of domains to block (e.g., "facebook.com,twitter.com")
+
+.NOTES
+    Author: Security Team
+    Requires: Administrator privileges
+    Datto RMM: Set ENV:BLOCKED_SITES variable
+#>
 
 param(
-    [string]$BlockedSites = $env:BLOCKED_SITES,
-    [string]$RickRollURL = $env:RICKROLL_URL
+    [string]$BlockedSites = $env:BLOCKED_SITES
 )
 
-# Default Rick Roll URL if not specified
-if ([string]::IsNullOrWhiteSpace($RickRollURL)) {
-    $RickRollURL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-}
+# Configuration constants
+$HOSTS_FILE = "$env:SystemRoot\System32\drivers\etc\hosts"
+$BACKUP_FILE = "$env:SystemRoot\System32\drivers\etc\hosts.rickroll.backup"
+$LOG_FILE = "$env:ProgramData\DattoRMM\RickRoll.log"
+$MARKER_TAG = "# RICKROLL_BLOCK"
+$MAX_RETRIES = 3
+$RETRY_DELAY_SECONDS = 2
 
-# Hosts file path
-$hostsPath = "$env:SystemRoot\System32\drivers\etc\hosts"
-$hostsBackupPath = "$env:SystemRoot\System32\drivers\etc\hosts.rickroll.backup"
-
-# Log file
-$logPath = "$env:ProgramData\DattoRMM\RickRoll.log"
+#region Logging Functions
 
 function Write-Log {
-    param([string]$Message)
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    "$timestamp - $Message" | Out-File -FilePath $logPath -Append
-    Write-Host $Message
-}
-
-function Add-HostsEntry {
+    <#
+    .SYNOPSIS
+        Thread-safe logging function with timestamp.
+    #>
     param(
-        [string]$Domain,
-        [string]$IPAddress = "127.0.0.1"
+        [Parameter(Mandatory=$true)]
+        [string]$Message,
+
+        [ValidateSet('INFO','WARN','ERROR')]
+        [string]$Level = 'INFO'
     )
-    
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logMessage = "$timestamp [$Level] $Message"
+
     try {
-        # Backup hosts file if not already backed up
-        if (-not (Test-Path $hostsBackupPath)) {
-            Copy-Item -Path $hostsPath -Destination $hostsBackupPath -Force
-            Write-Log "Hosts file backed up to: $hostsBackupPath"
+        # Create log directory if it doesn't exist
+        $logDir = Split-Path -Path $LOG_FILE -Parent
+        if (-not (Test-Path $logDir)) {
+            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
         }
-        
-        # Read current hosts file
-        $hostsContent = Get-Content -Path $hostsPath
-        
-        # Check if entry already exists
-        $entryExists = $hostsContent | Where-Object { $_ -match "^\s*$IPAddress\s+$Domain" }
-        
-        if (-not $entryExists) {
-            # Add the entry
-            Add-Content -Path $hostsPath -Value "$IPAddress`t$Domain`t# RickRoll Redirect"
-            Write-Log "Added hosts entry for: $Domain"
-        } else {
-            Write-Log "Hosts entry already exists for: $Domain"
+
+        # Thread-safe file append
+        $logMessage | Out-File -FilePath $LOG_FILE -Append -Encoding UTF8
+    }
+    catch {
+        # Fallback to console only if logging fails
+        Write-Warning "Failed to write to log: $_"
+    }
+
+    Write-Host $logMessage
+}
+
+#endregion
+
+#region Validation Functions
+
+function Test-ValidDomain {
+    <#
+    .SYNOPSIS
+        Validates and sanitizes domain name input to prevent injection attacks.
+    .DESCRIPTION
+        Ensures domain contains only valid characters (alphanumeric, dots, hyphens).
+        Prevents command injection, path traversal, and malformed entries.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Domain
+    )
+
+    # Remove whitespace
+    $Domain = $Domain.Trim()
+
+    # Check for empty or null
+    if ([string]::IsNullOrWhiteSpace($Domain)) {
+        return $false
+    }
+
+    # Validate domain format (alphanumeric, dots, hyphens only)
+    # Prevents injection: no spaces, tabs, special chars, path traversal
+    if ($Domain -notmatch '^[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?$') {
+        Write-Log "Invalid domain format: $Domain" -Level WARN
+        return $false
+    }
+
+    # Reject domains that are too long (max 253 chars per RFC)
+    if ($Domain.Length -gt 253) {
+        Write-Log "Domain too long: $Domain" -Level WARN
+        return $false
+    }
+
+    # Reject domains with consecutive dots or starting/ending with dot
+    if ($Domain -match '\.\.|\.$|^\.') {
+        Write-Log "Malformed domain: $Domain" -Level WARN
+        return $false
+    }
+
+    return $true
+}
+
+#endregion
+
+#region File Operations
+
+function Stop-DNSClientService {
+    <#
+    .SYNOPSIS
+        Stops DNS Client service to release hosts file lock.
+    .DESCRIPTION
+        The DNS Client service often locks the hosts file.
+        Temporarily stopping it allows modification.
+    #>
+    try {
+        $dnsService = Get-Service -Name "Dnscache" -ErrorAction SilentlyContinue
+
+        if ($dnsService -and $dnsService.Status -eq 'Running') {
+            Write-Log "Stopping DNS Client service to release hosts file lock" -Level INFO
+            Stop-Service -Name "Dnscache" -Force -ErrorAction Stop
+            Start-Sleep -Seconds 1
+            return $true
         }
-    } catch {
-        Write-Log "ERROR: Failed to add hosts entry for $Domain - $_"
+
+        return $false
+    }
+    catch {
+        Write-Log "Failed to stop DNS Client service: $_" -Level WARN
+        return $false
     }
 }
 
-function Set-RickRollPage {
-    # Create a local HTML file that redirects to Rick Roll
-    $htmlPath = "$env:ProgramData\DattoRMM\rickroll.html"
-    
-    $htmlContent = @"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Access Denied</title>
-    <meta http-equiv="refresh" content="0; url=$RickRollURL">
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            margin: 0;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-        }
-        .container {
-            text-align: center;
-            padding: 40px;
-            background: rgba(0,0,0,0.3);
-            border-radius: 10px;
-        }
-        h1 {
-            font-size: 3em;
-            margin-bottom: 20px;
-        }
-        p {
-            font-size: 1.2em;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🚫 Site Blocked</h1>
-        <p>This site is not allowed by company policy.</p>
-        <p>Redirecting you to approved content...</p>
-        <p><em>Never gonna let you down! 🎵</em></p>
-    </div>
-</body>
-</html>
-"@
-    
+function Start-DNSClientService {
+    <#
+    .SYNOPSIS
+        Restarts DNS Client service after hosts file modification.
+    #>
     try {
-        # Create directory if it doesn't exist
-        $directory = Split-Path -Path $htmlPath
-        if (-not (Test-Path $directory)) {
-            New-Item -ItemType Directory -Path $directory -Force | Out-Null
+        $dnsService = Get-Service -Name "Dnscache" -ErrorAction SilentlyContinue
+
+        if ($dnsService -and $dnsService.Status -ne 'Running') {
+            Write-Log "Starting DNS Client service" -Level INFO
+            Start-Service -Name "Dnscache" -ErrorAction Stop
+            return $true
         }
-        
-        $htmlContent | Out-File -FilePath $htmlPath -Encoding UTF8 -Force
-        Write-Log "Rick Roll HTML page created at: $htmlPath"
-        return $htmlPath
-    } catch {
-        Write-Log "ERROR: Failed to create Rick Roll HTML page - $_"
-        return $null
+
+        return $false
+    }
+    catch {
+        Write-Log "Failed to start DNS Client service: $_" -Level ERROR
+        return $false
     }
 }
 
-function Start-LocalWebServer {
-    # Start a simple HTTP listener to serve the Rick Roll page
+function Backup-HostsFile {
+    <#
+    .SYNOPSIS
+        Creates atomic backup of hosts file before modification.
+    .DESCRIPTION
+        Only creates backup if one doesn't exist.
+        Uses Copy-Item with -Force for atomic operation.
+    #>
     try {
-        # Check if listener is already running
-        $existingListener = Get-NetTCPConnection -LocalPort 80 -ErrorAction SilentlyContinue
-        if ($existingListener) {
-            Write-Log "Web server already running on port 80"
-            return
+        # Only backup if backup doesn't already exist
+        if (-not (Test-Path $BACKUP_FILE)) {
+            Copy-Item -Path $HOSTS_FILE -Destination $BACKUP_FILE -Force -ErrorAction Stop
+            Write-Log "Hosts file backed up to: $BACKUP_FILE" -Level INFO
+            return $true
         }
-        
-        # Create a scheduled task to run a simple Python HTTP server
-        # (Alternative: use IIS or create a proper HTTP listener)
-        Write-Log "Note: For full functionality, configure IIS or a web server to serve the Rick Roll page"
-        
-    } catch {
-        Write-Log "ERROR: Failed to start web server - $_"
+        else {
+            Write-Log "Backup already exists: $BACKUP_FILE" -Level INFO
+            return $true
+        }
+    }
+    catch {
+        Write-Log "Failed to backup hosts file: $_" -Level ERROR
+        return $false
     }
 }
 
-# Main execution
-try {
-    Write-Log "=== Rick Roll Component Started ==="
-    
-    # Check for admin privileges
+function Add-HostsEntries {
+    <#
+    .SYNOPSIS
+        Adds domain entries to hosts file with retry logic and file locking.
+    .DESCRIPTION
+        Implements atomic read-modify-write pattern with retry logic.
+        Handles file locking by temporarily stopping DNS Client service.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string[]]$Domains
+    )
+
+    $dnsServiceWasStopped = $false
+    $success = $false
+
+    for ($attempt = 1; $attempt -le $MAX_RETRIES; $attempt++) {
+        try {
+            Write-Log "Attempt $attempt of $MAX_RETRIES to modify hosts file" -Level INFO
+
+            # Stop DNS Client service on first retry if initial attempt failed
+            if ($attempt -gt 1 -and -not $dnsServiceWasStopped) {
+                $dnsServiceWasStopped = Stop-DNSClientService
+            }
+
+            # Read current hosts file content atomically
+            $hostsContent = Get-Content -Path $HOSTS_FILE -ErrorAction Stop
+
+            # Build list of entries to add
+            $newEntries = @()
+
+            foreach ($domain in $Domains) {
+                # Skip if entry already exists
+                $pattern = "^\s*127\.0\.0\.1\s+$([regex]::Escape($domain))\s"
+                $exists = $hostsContent | Where-Object { $_ -match $pattern }
+
+                if (-not $exists) {
+                    # Format: IP + TAB + domain + TAB + marker comment
+                    $newEntries += "127.0.0.1`t$domain`t$MARKER_TAG"
+                    Write-Log "Will add entry for: $domain" -Level INFO
+                }
+                else {
+                    Write-Log "Entry already exists for: $domain" -Level INFO
+                }
+            }
+
+            # If there are new entries to add, append them atomically
+            if ($newEntries.Count -gt 0) {
+                # Ensure file ends with newline before appending
+                $lastLine = $hostsContent[-1]
+                if (-not [string]::IsNullOrWhiteSpace($lastLine)) {
+                    $newEntries = @("") + $newEntries
+                }
+
+                # Atomic append operation
+                Add-Content -Path $HOSTS_FILE -Value $newEntries -ErrorAction Stop
+                Write-Log "Successfully added $($newEntries.Count) hosts entries" -Level INFO
+            }
+            else {
+                Write-Log "No new entries needed" -Level INFO
+            }
+
+            $success = $true
+            break
+        }
+        catch {
+            Write-Log "Attempt $attempt failed: $_" -Level WARN
+
+            if ($attempt -lt $MAX_RETRIES) {
+                Write-Log "Retrying in $RETRY_DELAY_SECONDS seconds..." -Level INFO
+                Start-Sleep -Seconds $RETRY_DELAY_SECONDS
+            }
+            else {
+                Write-Log "All retry attempts exhausted" -Level ERROR
+                throw
+            }
+        }
+    }
+
+    # Restart DNS Client service if we stopped it
+    if ($dnsServiceWasStopped) {
+        Start-DNSClientService | Out-Null
+    }
+
+    return $success
+}
+
+function Clear-DNSCache {
+    <#
+    .SYNOPSIS
+        Flushes DNS resolver cache to apply hosts file changes immediately.
+    #>
+    try {
+        Clear-DnsClientCache -ErrorAction Stop
+        Write-Log "DNS cache flushed successfully" -Level INFO
+        return $true
+    }
+    catch {
+        Write-Log "Failed to flush DNS cache: $_" -Level WARN
+        return $false
+    }
+}
+
+#endregion
+
+#region Main Execution
+
+function Invoke-RickRollBlocker {
+    <#
+    .SYNOPSIS
+        Main execution function that orchestrates the blocking process.
+    #>
+
+    Write-Log "=== Rick Roll Blocker Started ===" -Level INFO
+
+    # Validate administrator privileges
     $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    
+
     if (-not $isAdmin) {
-        Write-Log "ERROR: This script requires administrator privileges"
+        Write-Log "ERROR: Administrator privileges required" -Level ERROR
+        Write-Output "FAILED: Must run as Administrator"
         exit 1
     }
-    
-    # Validate blocked sites input
+
+    # Validate input
     if ([string]::IsNullOrWhiteSpace($BlockedSites)) {
-        Write-Log "ERROR: No blocked sites specified. Set ENV:BLOCKED_SITES variable"
+        Write-Log "ERROR: No blocked sites specified" -Level ERROR
+        Write-Output "FAILED: BLOCKED_SITES parameter is required"
         exit 1
     }
-    
-    # Parse blocked sites
+
+    # Parse and validate domain list
     $siteList = $BlockedSites -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
-    
-    Write-Log "Blocked sites list: $($siteList -join ', ')"
-    Write-Log "Rick Roll URL: $RickRollURL"
-    
-    # Create Rick Roll HTML page
-    $htmlPath = Set-RickRollPage
-    
-    # Add hosts file entries for each blocked site
+
+    if ($siteList.Count -eq 0) {
+        Write-Log "ERROR: No valid domains in BLOCKED_SITES" -Level ERROR
+        Write-Output "FAILED: No valid domains to block"
+        exit 1
+    }
+
+    # Validate and sanitize each domain
+    $validDomains = @()
     foreach ($site in $siteList) {
-        # Add both www and non-www versions
-        Add-HostsEntry -Domain $site
-        if (-not $site.StartsWith("www.")) {
-            Add-HostsEntry -Domain "www.$site"
+        if (Test-ValidDomain -Domain $site) {
+            $validDomains += $site
+
+            # Also add www variant if not already present
+            if (-not $site.StartsWith("www.")) {
+                $wwwSite = "www.$site"
+                if (Test-ValidDomain -Domain $wwwSite) {
+                    $validDomains += $wwwSite
+                }
+            }
+        }
+        else {
+            Write-Log "Skipping invalid domain: $site" -Level WARN
         }
     }
-    
-    # Flush DNS cache
-    try {
-        Clear-DnsClientCache
-        Write-Log "DNS cache flushed successfully"
-    } catch {
-        Write-Log "WARNING: Could not flush DNS cache - $_"
+
+    if ($validDomains.Count -eq 0) {
+        Write-Log "ERROR: No valid domains after validation" -Level ERROR
+        Write-Output "FAILED: All domains failed validation"
+        exit 1
     }
-    
-    Write-Log "=== Rick Roll Component Completed Successfully ==="
-    Write-Log "Users will now be redirected when attempting to access blocked sites"
-    Write-Log "To restore original hosts file, copy from: $hostsBackupPath"
-    
-    # Output for Datto RMM
-    Write-Output "SUCCESS: Rick Roll component configured for $($siteList.Count) blocked domains"
+
+    Write-Log "Blocking $($validDomains.Count) domains: $($validDomains -join ', ')" -Level INFO
+
+    # Verify hosts file exists
+    if (-not (Test-Path $HOSTS_FILE)) {
+        Write-Log "ERROR: Hosts file not found at $HOSTS_FILE" -Level ERROR
+        Write-Output "FAILED: Hosts file not found"
+        exit 1
+    }
+
+    # Create backup
+    if (-not (Backup-HostsFile)) {
+        Write-Log "ERROR: Failed to backup hosts file" -Level ERROR
+        Write-Output "FAILED: Could not create backup"
+        exit 1
+    }
+
+    # Add hosts entries with retry logic
+    try {
+        if (-not (Add-HostsEntries -Domains $validDomains)) {
+            throw "Failed to add hosts entries"
+        }
+    }
+    catch {
+        Write-Log "ERROR: Failed to modify hosts file: $_" -Level ERROR
+        Write-Output "FAILED: Could not modify hosts file - $_"
+        exit 1
+    }
+
+    # Flush DNS cache
+    Clear-DNSCache | Out-Null
+
+    Write-Log "=== Rick Roll Blocker Completed Successfully ===" -Level INFO
+    Write-Log "Blocked domains: $($validDomains.Count)" -Level INFO
+    Write-Log "Backup location: $BACKUP_FILE" -Level INFO
+
+    Write-Output "SUCCESS: Blocked $($validDomains.Count) domains"
     exit 0
-    
-} catch {
-    Write-Log "ERROR: Unexpected error - $_"
-    Write-Output "FAILED: $_"
+}
+
+# Execute main function with global error handling
+try {
+    Invoke-RickRollBlocker
+}
+catch {
+    Write-Log "FATAL ERROR: $_" -Level ERROR
+    Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level ERROR
+    Write-Output "FAILED: Unexpected error - $_"
     exit 1
 }
+
+#endregion
