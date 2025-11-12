@@ -444,59 +444,128 @@ try {
 function Start-HTTPListenerService {
     <#
     .SYNOPSIS
-        Creates scheduled task and starts HTTP listener.
+        Creates scheduled task and starts HTTP listener with fallback mechanisms.
     .DESCRIPTION
-        Registers a scheduled task that runs the HTTP listener at system startup
-        and starts it immediately as a background process.
+        Attempts multiple methods to start the HTTP listener:
+        1. Scheduled task (for persistence across reboots)
+        2. Direct background process (fallback if scheduled task fails)
+        3. Verifies listener is responding with actual HTTP test
     #>
     try {
         Write-Log "Configuring HTTP listener service" -Level INFO
 
-        # Check if scheduled task already exists
-        $existingTask = Get-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
+        # Check if port 80 is already in use
+        $existingListener = Get-NetTCPConnection -LocalPort 80 -State Listen -ErrorAction SilentlyContinue
+        if ($existingListener) {
+            $owningProcess = Get-Process -Id $existingListener.OwningProcess -ErrorAction SilentlyContinue
+            if ($owningProcess.ProcessName -like "*powershell*" -or $owningProcess.ProcessName -like "*pwsh*") {
+                Write-Log "HTTP listener already running on port 80 (PID: $($owningProcess.Id))" -Level INFO
+                return $true
+            }
+            else {
+                Write-Log "ERROR: Port 80 is in use by $($owningProcess.ProcessName) (PID: $($owningProcess.Id))" -Level ERROR
+                Write-Log "Stop the conflicting service and retry deployment" -Level ERROR
+                return $false
+            }
+        }
 
+        # Method 1: Create and start scheduled task
+        Write-Log "Attempting scheduled task deployment" -Level INFO
+
+        $existingTask = Get-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
         if ($existingTask) {
             Write-Log "Removing existing scheduled task" -Level INFO
             Unregister-ScheduledTask -TaskName $TASK_NAME -Confirm:$false -ErrorAction SilentlyContinue
         }
 
-        # Create scheduled task action
+        # Create scheduled task
         $action = New-ScheduledTaskAction -Execute "PowerShell.exe" `
             -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$LISTENER_SCRIPT`" -RickRollURL `"$RickRollURL`""
-
-        # Create scheduled task trigger (at startup)
         $trigger = New-ScheduledTaskTrigger -AtStartup
-
-        # Create scheduled task principal (run as SYSTEM with highest privileges)
         $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-
-        # Create scheduled task settings
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 
-        # Register the scheduled task
         Register-ScheduledTask -TaskName $TASK_NAME -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "Rick Roll HTTP redirect listener for blocked domains" | Out-Null
-
         Write-Log "Scheduled task '$TASK_NAME' created successfully" -Level INFO
 
-        # Start the listener immediately as background job
-        Write-Log "Starting HTTP listener process" -Level INFO
+        # Start scheduled task
+        Write-Log "Starting scheduled task" -Level INFO
         Start-ScheduledTask -TaskName $TASK_NAME -ErrorAction Stop
+        Start-Sleep -Seconds 3
 
-        # Wait a moment and verify it started
-        Start-Sleep -Seconds 2
+        # Verify scheduled task method worked
         $listenerPort = Get-NetTCPConnection -LocalPort 80 -State Listen -ErrorAction SilentlyContinue
-
         if ($listenerPort) {
-            Write-Log "HTTP listener is running on port 80" -Level INFO
-            return $true
+            Write-Log "HTTP listener started successfully via scheduled task" -Level INFO
+
+            # Test with actual HTTP request
+            if (Test-HTTPListener) {
+                Write-Log "HTTP listener verified and responding correctly" -Level INFO
+                return $true
+            }
         }
-        else {
-            Write-Log "HTTP listener may not be running (check firewall/port conflicts)" -Level WARN
-            return $true  # Don't fail deployment if listener doesn't start immediately
+
+        # Method 2: Fallback to direct background process
+        Write-Log "Scheduled task method failed, trying direct background process" -Level WARN
+
+        $listenerArgs = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$LISTENER_SCRIPT`" -RickRollURL `"$RickRollURL`""
+
+        Start-Process -FilePath "PowerShell.exe" `
+            -ArgumentList $listenerArgs `
+            -WindowStyle Hidden `
+            -PassThru | Out-Null
+
+        Write-Log "Started HTTP listener as background process" -Level INFO
+        Start-Sleep -Seconds 4
+
+        # Verify direct process method worked
+        $listenerPort = Get-NetTCPConnection -LocalPort 80 -State Listen -ErrorAction SilentlyContinue
+        if ($listenerPort) {
+            Write-Log "HTTP listener started successfully via background process" -Level INFO
+
+            # Test with actual HTTP request
+            if (Test-HTTPListener) {
+                Write-Log "HTTP listener verified and responding correctly" -Level INFO
+                Write-Log "NOTE: Listener running as process, not scheduled task. May not survive reboot." -Level WARN
+                return $true
+            }
         }
+
+        # Both methods failed
+        Write-Log "ERROR: Failed to start HTTP listener using all methods" -Level ERROR
+        Write-Log "Check for port conflicts, firewall rules, or permissions issues" -Level ERROR
+        return $false
     }
     catch {
         Write-Log "Failed to start HTTP listener service: $_" -Level ERROR
+        return $false
+    }
+}
+
+function Test-HTTPListener {
+    <#
+    .SYNOPSIS
+        Tests if HTTP listener is actually responding to requests.
+    .DESCRIPTION
+        Makes a test HTTP request to localhost:80 to verify the listener
+        is not just bound to the port but actually serving content.
+    #>
+    try {
+        Write-Log "Testing HTTP listener response" -Level INFO
+
+        $testResponse = Invoke-WebRequest -Uri "http://127.0.0.1:80" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+
+        if ($testResponse.StatusCode -eq 200 -and $testResponse.Content -like "*Site Blocked*") {
+            Write-Log "HTTP listener test successful: Serving redirect page" -Level INFO
+            return $true
+        }
+        else {
+            Write-Log "HTTP listener responding but with unexpected content" -Level WARN
+            return $false
+        }
+    }
+    catch {
+        Write-Log "HTTP listener test failed: $_" -Level ERROR
         return $false
     }
 }
@@ -598,15 +667,18 @@ function Invoke-RickRollBlocker {
     Write-Log "Setting up HTTP redirect listener" -Level INFO
 
     if (-not (Deploy-HTTPListener)) {
-        Write-Log "WARNING: HTTP listener deployment failed, redirects may not work" -Level WARN
-        Write-Output "WARNING: Hosts file updated but HTTP listener failed to deploy"
-        exit 0
+        Write-Log "ERROR: HTTP listener deployment failed" -Level ERROR
+        Write-Output "FAILED: Could not deploy HTTP listener script - Rick Roll redirects will not work"
+        Write-Output "Hosts file has been updated but users will see 'connection refused' instead of redirect"
+        exit 1
     }
 
     if (-not (Start-HTTPListenerService)) {
-        Write-Log "WARNING: HTTP listener service failed to start" -Level WARN
-        Write-Output "WARNING: Hosts file updated but HTTP listener failed to start"
-        exit 0
+        Write-Log "ERROR: HTTP listener service failed to start" -Level ERROR
+        Write-Output "FAILED: Could not start HTTP listener - Rick Roll redirects will not work"
+        Write-Output "Common causes: Port 80 in use (IIS/Apache), firewall blocking, or permission issues"
+        Write-Output "Check log file: C:\ProgramData\DattoRMM\RickRoll.log"
+        exit 1
     }
 
     Write-Log "=== Rick Roll Blocker Completed Successfully ===" -Level INFO
@@ -616,6 +688,7 @@ function Invoke-RickRollBlocker {
     Write-Log "HTTP listener: Active on port 80" -Level INFO
 
     Write-Output "SUCCESS: Blocked $($validDomains.Count) domains with HTTP redirect active"
+    Write-Output "Rick Roll listener verified and responding on localhost:80"
     exit 0
 }
 
